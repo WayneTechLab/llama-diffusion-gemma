@@ -1,136 +1,290 @@
 #!/usr/bin/env python3
 """
-OpenAI-compatible API server wrapping llama-diffusion-cli for DiffusionGemma.
-Exposes /v1/chat/completions and /v1/models so any OpenAI client works.
+DiffusionGemma server with full Ollama-compatible API + OpenAI-compatible API.
+
+Listens on port 11435.  Acts as an Ollama-compatible proxy:
+  - Requests for diffusion-gemma (or the HuggingFace alias) are handled locally
+    via llama-diffusion-cli with the Metal OOM fixes applied.
+  - All other model requests are forwarded to the real Ollama at localhost:11434.
+
+Usage:
+  OLLAMA_HOST=http://localhost:11435 ollama run diffusion-gemma
+  curl http://localhost:11435/api/chat  ...
+  curl http://localhost:11435/v1/chat/completions  ...  (OpenAI-compat)
 """
 import asyncio
 import json
+import re
 import time
 import uuid
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-MODEL_PATH = "/Users/waynetechlab/AI/models/diffusiongemma/diffusiongemma-26B-A4B-it-Q4_K_M.gguf"
-BINARY    = "/Users/waynetechlab/AI/llama.cpp-diffusiongemma/build/bin/llama-diffusion-cli"
-MODEL_ID  = "diffusion-gemma"
+# ── Config ─────────────────────────────────────────────────────────────────────
 
-# Both Metal OOM root causes fixed: sc_embT now falls back to CPU when GPU memory is tight,
-# and n_ubatch is correctly sized to canvas_length for the KV-cache path.
-NGL = "99"  # GPU layers: 99 = all layers on Metal
+MODEL_PATH   = "/Users/waynetechlab/AI/models/diffusiongemma/diffusiongemma-26B-A4B-it-Q4_K_M.gguf"
+BINARY       = "/Users/waynetechlab/AI/llama.cpp-diffusiongemma/build/bin/llama-diffusion-cli"
+NGL          = "99"          # Metal GPU layers
+OLLAMA_UPSTREAM = "http://localhost:11434"
+PORT         = 11435
 
-app = FastAPI(title="DiffusionGemma OpenAI-compatible API")
-_infer_lock = asyncio.Semaphore(1)  # one inference at a time — model is 16 GB on GPU
+# Model name aliases that this server handles (everything else proxies upstream)
+DIFFUSION_NAMES = {
+    "diffusion-gemma",
+    "hf.co/unsloth/diffusiongemma-26B-A4B-it-GGUF:Q4_K_M",
+    "hf.co/unsloth/diffusiongemma-26B-A4B-it-GGUF",
+}
+
+app = FastAPI(title="DiffusionGemma Ollama-compatible API")
+_infer_lock = asyncio.Semaphore(1)  # one inference at a time (16 GB model on GPU)
 
 
-# ── Pydantic models ────────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def is_diffusion_model(name: Optional[str]) -> bool:
+    if not name:
+        return False
+    return name.strip() in DIFFUSION_NAMES or name.startswith("diffusion-gemma")
+
+
+def messages_to_prompt(messages: List[Dict]) -> str:
+    parts = []
+    for m in messages:
+        role    = m.get("role", "user")
+        content = m.get("content", "")
+        if role == "system":
+            parts.append(f"<system>{content}</system>")
+        elif role == "user":
+            parts.append(f"<start_of_turn>user\n{content}<end_of_turn>")
+        elif role == "assistant":
+            parts.append(f"<start_of_turn>model\n{content}<end_of_turn>")
+    parts.append("<start_of_turn>model\n")
+    return "\n".join(parts)
+
+
+def build_cmd(prompt: str, n: int = 128, temp: float = 0.7,
+              steps: int = 16, algo: int = 4, block: int = 16) -> List[str]:
+    return [
+        BINARY, "-m", MODEL_PATH, "-p", prompt,
+        "-ngl", NGL, "-n", str(n),
+        "--temp", str(temp),
+        "--diffusion-steps", str(steps),
+        "--diffusion-algorithm", str(algo),
+        "--diffusion-block-length", str(block),
+        "--log-colors", "off",
+    ]
+
+
+def parse_output(raw: str) -> str:
+    match = re.search(r"<channel\|>(.*?)(?:total time:|$)", raw, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    raw = re.sub(r"^<\|channel>thought\s*", "", raw.strip())
+    lines = [l for l in raw.splitlines() if not l.startswith("total time:")]
+    return "\n".join(lines).strip()
+
+
+async def run_inference(cmd: List[str], timeout: int = 900) -> str:
+    async with _infer_lock:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise HTTPException(status_code=504, detail="Inference timed out")
+        if proc.returncode != 0:
+            raise HTTPException(status_code=500, detail="Inference failed - check GPU/model")
+        return parse_output(stdout.decode("utf-8", errors="replace"))
+
+
+# ── Proxy helper ───────────────────────────────────────────────────────────────
+
+async def proxy_to_ollama(request: Request) -> JSONResponse:
+    body  = await request.body()
+    async with httpx.AsyncClient(timeout=900) as client:
+        resp = await client.request(
+            method  = request.method,
+            url     = f"{OLLAMA_UPSTREAM}{request.url.path}",
+            headers = {k: v for k, v in request.headers.items() if k.lower() != "host"},
+            content = body,
+        )
+    return JSONResponse(content=resp.json(), status_code=resp.status_code)
+
+
+# ── Ollama API ─────────────────────────────────────────────────────────────────
+
+@app.get("/api/tags")
+async def ollama_tags(request: Request):
+    """Merge our model into the upstream Ollama tag list."""
+    our_model = {
+        "name":        "diffusion-gemma",
+        "model":       "diffusion-gemma",
+        "modified_at": "2026-06-11T00:00:00Z",
+        "size":        16806811129,
+        "digest":      "local",
+        "details": {
+            "format":             "gguf",
+            "family":             "diffusion-gemma",
+            "parameter_size":     "26B",
+            "quantization_level": "Q4_K_M",
+        },
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(f"{OLLAMA_UPSTREAM}/api/tags")
+            data = r.json()
+            data["models"] = [our_model] + [
+                m for m in data.get("models", [])
+                if not is_diffusion_model(m.get("name"))
+            ]
+            return JSONResponse(data)
+    except Exception:
+        return JSONResponse({"models": [our_model]})
+
+
+@app.post("/api/chat")
+async def ollama_chat(request: Request):
+    body = await request.json()
+    if not is_diffusion_model(body.get("model")):
+        return await proxy_to_ollama(request)
+
+    messages  = body.get("messages", [])
+    stream    = body.get("stream", True)
+    opts      = body.get("options", {})
+    n         = opts.get("num_predict", body.get("max_tokens", 128))
+    temp      = opts.get("temperature", 0.7)
+    steps     = opts.get("diffusion_steps", 16)
+    prompt    = messages_to_prompt(messages)
+    cmd       = build_cmd(prompt, n=n, temp=temp, steps=steps)
+    ts        = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    if stream:
+        async def stream_gen():
+            async with _infer_lock:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await proc.communicate()
+            content = parse_output(stdout.decode("utf-8", errors="replace"))
+            # Ollama streams word by word; we emit in one chunk then done
+            chunk = {"model": "diffusion-gemma", "created_at": ts,
+                     "message": {"role": "assistant", "content": content},
+                     "done": False}
+            yield json.dumps(chunk) + "\n"
+            done  = {"model": "diffusion-gemma", "created_at": ts,
+                     "message": {"role": "assistant", "content": ""},
+                     "done": True, "done_reason": "stop"}
+            yield json.dumps(done) + "\n"
+
+        return StreamingResponse(stream_gen(), media_type="application/x-ndjson")
+
+    content = await run_inference(cmd)
+    return JSONResponse({
+        "model":      "diffusion-gemma",
+        "created_at": ts,
+        "message":    {"role": "assistant", "content": content},
+        "done":       True,
+        "done_reason": "stop",
+    })
+
+
+@app.post("/api/generate")
+async def ollama_generate(request: Request):
+    body = await request.json()
+    if not is_diffusion_model(body.get("model")):
+        return await proxy_to_ollama(request)
+
+    prompt = body.get("prompt", "")
+    opts   = body.get("options", {})
+    n      = opts.get("num_predict", body.get("max_tokens", 128))
+    temp   = opts.get("temperature", 0.7)
+    steps  = opts.get("diffusion_steps", 16)
+    cmd    = build_cmd(prompt, n=n, temp=temp, steps=steps)
+    ts     = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    stream = body.get("stream", True)
+
+    if stream:
+        async def stream_gen():
+            async with _infer_lock:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await proc.communicate()
+            content = parse_output(stdout.decode("utf-8", errors="replace"))
+            yield json.dumps({"model": "diffusion-gemma", "created_at": ts,
+                              "response": content, "done": False}) + "\n"
+            yield json.dumps({"model": "diffusion-gemma", "created_at": ts,
+                              "response": "", "done": True}) + "\n"
+
+        return StreamingResponse(stream_gen(), media_type="application/x-ndjson")
+
+    content = await run_inference(cmd)
+    return JSONResponse({
+        "model": "diffusion-gemma", "created_at": ts,
+        "response": content, "done": True,
+    })
+
+
+@app.post("/api/show")
+async def ollama_show(request: Request):
+    body = await request.json()
+    if not is_diffusion_model(body.get("model", body.get("name"))):
+        return await proxy_to_ollama(request)
+    return JSONResponse({
+        "modelfile": "FROM diffusion-gemma\n",
+        "details": {"family": "diffusion-gemma", "parameter_size": "26B",
+                    "quantization_level": "Q4_K_M"},
+    })
+
+
+@app.api_route("/api/{path:path}", methods=["GET", "POST", "DELETE", "HEAD"])
+async def proxy_other_ollama(request: Request, path: str):
+    return await proxy_to_ollama(request)
+
+
+# ── OpenAI-compatible API ──────────────────────────────────────────────────────
 
 class Message(BaseModel):
     role: str
     content: str
 
 class ChatRequest(BaseModel):
-    model: Optional[str] = MODEL_ID
+    model: Optional[str] = "diffusion-gemma"
     messages: List[Message]
-    max_tokens: Optional[int] = 64   # keep low for interactive speed on CPU
+    max_tokens: Optional[int] = 128
     temperature: Optional[float] = 0.7
     stream: Optional[bool] = False
-    diffusion_steps: Optional[int] = 32   # fewer steps = faster, slightly lower quality
+    diffusion_steps: Optional[int] = 16
     diffusion_algorithm: Optional[int] = 4
     diffusion_block_length: Optional[int] = 16
 
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-def messages_to_prompt(messages: List[Message]) -> str:
-    """Convert chat messages to a single prompt string."""
-    parts = []
-    for m in messages:
-        if m.role == "system":
-            parts.append(f"<system>{m.content}</system>")
-        elif m.role == "user":
-            parts.append(f"<start_of_turn>user\n{m.content}<end_of_turn>")
-        elif m.role == "assistant":
-            parts.append(f"<start_of_turn>model\n{m.content}<end_of_turn>")
-    parts.append("<start_of_turn>model\n")
-    return "\n".join(parts)
-
-def build_cmd(prompt: str, req: ChatRequest) -> List[str]:
-    # Let the binary handle n_ubatch sizing (fixed to use canvas_length for KV path).
-    # Do not pass -ub to avoid overriding the internal calculation.
-    return [
-        BINARY,
-        "-m", MODEL_PATH,
-        "-p", prompt,
-        "-ngl", NGL,
-        "-n", str(req.max_tokens),
-        "--temp", str(req.temperature),
-        "--diffusion-steps", str(req.diffusion_steps),
-        "--diffusion-algorithm", str(req.diffusion_algorithm),
-        "--diffusion-block-length", str(req.diffusion_block_length),
-        "--log-colors", "off",
-    ]
-
-def parse_output(raw: str) -> str:
-    """Extract assistant reply from diffusion-cli stdout.
-    Format: <|channel>thought\\n[thinking]\\n<channel|>[reply]\\ntotal time:...
-    If response completes, return only the final reply.
-    If truncated mid-think, strip the channel header and return what we have.
-    """
-    import re
-    # Full response: extract text after closing <channel|> tag
-    match = re.search(r"<channel\|>(.*?)(?:total time:|$)", raw, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    # Truncated thinking: strip <|channel>thought header + timing footer
-    raw = re.sub(r"^<\|channel>thought\s*", "", raw.strip())
-    lines = [l for l in raw.splitlines() if not l.startswith("total time:")]
-    return "\n".join(lines).strip()
-
-def make_response(content: str, req_id: str, finish_reason: str = "stop") -> dict:
+def make_openai_response(content: str, req_id: str) -> dict:
     return {
-        "id": f"chatcmpl-{req_id}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": MODEL_ID,
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": content},
-            "finish_reason": finish_reason,
-        }],
+        "id": f"chatcmpl-{req_id}", "object": "chat.completion",
+        "created": int(time.time()), "model": "diffusion-gemma",
+        "choices": [{"index": 0,
+                     "message": {"role": "assistant", "content": content},
+                     "finish_reason": "stop"}],
         "usage": {"prompt_tokens": -1, "completion_tokens": -1, "total_tokens": -1},
     }
 
-def make_stream_chunk(delta: str, req_id: str, finish_reason=None) -> str:
-    chunk = {
-        "id": f"chatcmpl-{req_id}",
-        "object": "chat.completion.chunk",
-        "created": int(time.time()),
-        "model": MODEL_ID,
-        "choices": [{
-            "index": 0,
-            "delta": {"content": delta} if delta else {},
-            "finish_reason": finish_reason,
-        }],
-    }
-    return f"data: {json.dumps(chunk)}\n\n"
-
-
-# ── Routes ─────────────────────────────────────────────────────────────────────
-
 @app.get("/v1/models")
 async def list_models():
-    return {
-        "object": "list",
-        "data": [{
-            "id": MODEL_ID,
-            "object": "model",
-            "created": 0,
-            "owned_by": "local",
-        }]
-    }
+    return {"object": "list", "data": [
+        {"id": "diffusion-gemma", "object": "model", "created": 0, "owned_by": "local"}
+    ]}
 
 @app.get("/health")
 async def health():
@@ -138,52 +292,38 @@ async def health():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest):
-    prompt = messages_to_prompt(req.messages)
-    cmd    = build_cmd(prompt, req)
+    prompt  = messages_to_prompt([m.dict() for m in req.messages])
+    cmd     = build_cmd(prompt, n=req.max_tokens, temp=req.temperature,
+                        steps=req.diffusion_steps, algo=req.diffusion_algorithm,
+                        block=req.diffusion_block_length)
 
     if req.stream:
+        req_id = uuid.uuid4().hex
         async def stream_gen():
-            req_id = uuid.uuid4().hex
-            yield make_stream_chunk("", req_id)  # role delta
             async with _infer_lock:
                 proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                async for line in proc.stdout:
-                    text = line.decode("utf-8", errors="replace")
-                    yield make_stream_chunk(text, req_id)
-                await proc.wait()
-            yield make_stream_chunk("", req_id, finish_reason="stop")
-            yield "data: [DONE]\n\n"
-
+                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+                stdout, _ = await proc.communicate()
+            content = parse_output(stdout.decode("utf-8", errors="replace"))
+            chunk = {"id": f"chatcmpl-{req_id}", "object": "chat.completion.chunk",
+                     "created": int(time.time()), "model": "diffusion-gemma",
+                     "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]}
+            yield f"data: {json.dumps(chunk)}\n\n"
+            done = {"id": f"chatcmpl-{req_id}", "object": "chat.completion.chunk",
+                    "created": int(time.time()), "model": "diffusion-gemma",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+            yield f"data: {json.dumps(done)}\n\ndata: [DONE]\n\n"
         return StreamingResponse(stream_gen(), media_type="text/event-stream")
 
-    # Non-streaming
-    async with _infer_lock:
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            try:
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=600)
-            except asyncio.TimeoutError:
-                proc.kill()
-                raise HTTPException(status_code=504, detail="Inference timed out")
-            output = parse_output(stdout.decode("utf-8", errors="replace"))
-            if proc.returncode != 0 and not output:
-                raise HTTPException(status_code=500, detail="Inference failed - check model/memory")
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
-
-    return make_response(output, uuid.uuid4().hex)
+    content = await run_inference(cmd)
+    return make_openai_response(content, uuid.uuid4().hex)
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8081, log_level="info")
+    print(f"DiffusionGemma proxy listening on port {PORT}")
+    print(f"  Ollama API:  http://localhost:{PORT}/api/chat")
+    print(f"  OpenAI API:  http://localhost:{PORT}/v1/chat/completions")
+    print(f"  Set:  OLLAMA_HOST=http://localhost:{PORT}")
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
+
