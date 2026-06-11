@@ -27,7 +27,7 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>OLLAMA_HOST</key>
-    <string>0.0.0.0:11450</string>
+    <string>0.0.0.0:11456</string>
     <key>OLLAMA_ORIGINS</key>
     <string>*</string>
     <key>HOME</key>

@@ -29,8 +29,9 @@ from pydantic import BaseModel
 MODEL_PATH   = "/Users/waynetechlab/AI/models/diffusiongemma/diffusiongemma-26B-A4B-it-Q4_K_M.gguf"
 BINARY       = "/Users/waynetechlab/AI/llama.cpp-diffusiongemma/build/bin/llama-diffusion-cli"
 NGL          = "99"          # Metal GPU layers
-OLLAMA_UPSTREAM = "http://localhost:11450"
+OLLAMA_UPSTREAM = "http://localhost:11456"
 PORT         = 11434
+PORT2        = 11450  # Ollama.app connects here directly; we intercept it too
 
 # Model name aliases that this server handles (everything else proxies upstream)
 DIFFUSION_NAMES = {
@@ -329,15 +330,27 @@ async def chat_completions(req: ChatRequest):
 
 if __name__ == "__main__":
     import socket
+    import threading
     import uvicorn
 
-    # Create a dual-stack socket (IPv4 + IPv6) by disabling IPV6_V6ONLY.
-    # macOS sets IPV6_V6ONLY=1 by default, so binding to '::' alone misses IPv4.
-    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("::", PORT))
-    sock.listen(128)
+    def make_dual_stack_socket(port: int) -> socket.socket:
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("::", port))
+        sock.listen(128)
+        return sock
 
-    print(f"DiffusionGemma proxy on port {PORT} (IPv4+IPv6)")
-    uvicorn.run(app, fd=sock.fileno(), log_level="warning")
+    def run_on_socket(sock: socket.socket):
+        uvicorn.run(app, fd=sock.fileno(), log_level="warning")
+
+    # Own both 11434 (external) and 11450 (Ollama.app connects here directly).
+    # Real ollama serve is on 11456 — never reachable without going through us.
+    sock1 = make_dual_stack_socket(PORT)
+    sock2 = make_dual_stack_socket(PORT2)
+
+    print(f"DiffusionGemma proxy on :{PORT} + :{PORT2} (IPv4+IPv6)")
+
+    t = threading.Thread(target=run_on_socket, args=(sock2,), daemon=True)
+    t.start()
+    run_on_socket(sock1)   # main thread blocks here
