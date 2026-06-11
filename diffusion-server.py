@@ -328,10 +328,16 @@ async def chat_completions(req: ChatRequest):
 
 
 if __name__ == "__main__":
+    import socket
     import uvicorn
-    print(f"DiffusionGemma proxy listening on port {PORT}")
-    print(f"  Ollama API:  http://localhost:{PORT}/api/chat")
-    print(f"  OpenAI API:  http://localhost:{PORT}/v1/chat/completions")
-    print(f"  Set:  OLLAMA_HOST=http://localhost:{PORT}")
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
 
+    # Create a dual-stack socket (IPv4 + IPv6) by disabling IPV6_V6ONLY.
+    # macOS sets IPV6_V6ONLY=1 by default, so binding to '::' alone misses IPv4.
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("::", PORT))
+    sock.listen(128)
+
+    print(f"DiffusionGemma proxy on port {PORT} (IPv4+IPv6)")
+    uvicorn.run(app, fd=sock.fileno(), log_level="warning")
