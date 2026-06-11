@@ -1,23 +1,18 @@
 diff --git a/src/models/diffusion-gemma.cpp b/src/models/diffusion-gemma.cpp
-index 5491487d1..04c88e17e 100644
+index 5491487d1..49bea50a1 100644
 --- a/src/models/diffusion-gemma.cpp
 +++ b/src/models/diffusion-gemma.cpp
-@@ -545,7 +545,17 @@ static void dg_ensure_sc_embT(const llama_model_diffusion_gemma & m) {
+@@ -544,8 +544,11 @@ static void dg_ensure_sc_embT(const llama_model_diffusion_gemma & m) {
+     m.sc_embT = ggml_new_tensor_2d(m.sc_embT_ctx, GGML_TYPE_F16, n_vocab, n_embd);
      ggml_set_name(m.sc_embT, "sc_embT");
  
-     ggml_backend_dev_t dev = m.dev_layer(0);
+-    ggml_backend_dev_t dev = m.dev_layer(0);
 -    ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
++    // sc_embT is F16 [n_vocab, n_embd] -- ~1.4 GB for the 26B model.
++    // Always keep on CPU: putting it on Metal leaves only ~800 MiB headroom after
++    // the 16 GB model, which is insufficient for the compute buffer and causes OOM.
++    // The SC matmul is one op per step; host<->device transfer cost is negligible.
 +    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
-+    if (dev) {
-+        // sc_embT is F16 [n_vocab, n_embd]; on large models this can be >1 GB on GPU.
-+        // Fall back to CPU when the remaining GPU budget is too tight to avoid OOM.
-+        const size_t sc_size = (size_t) n_vocab * n_embd * sizeof(ggml_fp16_t);
-+        size_t mem_free = 0, mem_total = 0;
-+        ggml_backend_dev_memory(dev, &mem_free, &mem_total);
-+        if (mem_free > sc_size + (512ULL << 20)) {  // require 512 MiB headroom for compute
-+            buft = ggml_backend_dev_buffer_type(dev);
-+        }
-+    }
      m.sc_embT_buf = ggml_backend_alloc_ctx_tensors_from_buft(m.sc_embT_ctx, buft);
      GGML_ASSERT(m.sc_embT_buf != nullptr);
      ggml_backend_buffer_set_usage(m.sc_embT_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);

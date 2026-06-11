@@ -5,7 +5,6 @@ Exposes /v1/chat/completions and /v1/models so any OpenAI client works.
 """
 import asyncio
 import json
-import subprocess
 import time
 import uuid
 from typing import List, Optional
@@ -23,6 +22,7 @@ MODEL_ID  = "diffusion-gemma"
 NGL = "99"  # GPU layers: 99 = all layers on Metal
 
 app = FastAPI(title="DiffusionGemma OpenAI-compatible API")
+_infer_lock = asyncio.Semaphore(1)  # one inference at a time — model is 16 GB on GPU
 
 
 # ── Pydantic models ────────────────────────────────────────────────────────────
@@ -58,17 +58,14 @@ def messages_to_prompt(messages: List[Message]) -> str:
     return "\n".join(parts)
 
 def build_cmd(prompt: str, req: ChatRequest) -> List[str]:
-    # -ngl 0: CPU-only to avoid Metal OOM on 26B model within 18GB unified memory.
-    # -n: output tokens; -ub must be >= prompt_tokens + n (pad generously).
-    n_out = req.max_tokens
-    ub    = n_out + 512  # 512-token prompt headroom
+    # Let the binary handle n_ubatch sizing (fixed to use canvas_length for KV path).
+    # Do not pass -ub to avoid overriding the internal calculation.
     return [
         BINARY,
         "-m", MODEL_PATH,
         "-p", prompt,
         "-ngl", NGL,
-        "-n", str(n_out),
-        "-ub", str(ub),
+        "-n", str(req.max_tokens),
         "--temp", str(req.temperature),
         "--diffusion-steps", str(req.diffusion_steps),
         "--diffusion-algorithm", str(req.diffusion_algorithm),
@@ -148,34 +145,41 @@ async def chat_completions(req: ChatRequest):
         async def stream_gen():
             req_id = uuid.uuid4().hex
             yield make_stream_chunk("", req_id)  # role delta
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            async for line in proc.stdout:
-                text = line.decode("utf-8", errors="replace")
-                yield make_stream_chunk(text, req_id)
-            await proc.wait()
+            async with _infer_lock:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                async for line in proc.stdout:
+                    text = line.decode("utf-8", errors="replace")
+                    yield make_stream_chunk(text, req_id)
+                await proc.wait()
             yield make_stream_chunk("", req_id, finish_reason="stop")
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(stream_gen(), media_type="text/event-stream")
 
     # Non-streaming
-    try:
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=600,
-        )
-        output = parse_output(result.stdout)
-        if result.returncode != 0 and not output:
-            raise HTTPException(status_code=500, detail="Inference failed — check model/memory")
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=504, detail="Inference timed out")
+    async with _infer_lock:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=600)
+            except asyncio.TimeoutError:
+                proc.kill()
+                raise HTTPException(status_code=504, detail="Inference timed out")
+            output = parse_output(stdout.decode("utf-8", errors="replace"))
+            if proc.returncode != 0 and not output:
+                raise HTTPException(status_code=500, detail="Inference failed - check model/memory")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
 
     return make_response(output, uuid.uuid4().hex)
 
