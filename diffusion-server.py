@@ -15,13 +15,12 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 MODEL_PATH = "/Users/waynetechlab/AI/models/diffusiongemma/diffusiongemma-26B-A4B-it-Q4_K_M.gguf"
-BINARY    = "/Users/waynetechlab/bin/llama-diffusion-cli"
+BINARY    = "/Users/waynetechlab/AI/llama.cpp-diffusiongemma/build/bin/llama-diffusion-cli"
 MODEL_ID  = "diffusion-gemma"
 
-# Apple Silicon M-series: Metal OOM bug in PR #24423 for full-canvas attention pass.
-# CPU-only is the only reliable path until the bug is fixed upstream.
-# Expect ~70s/64 tokens on M4 Pro. Keep max_tokens ≤ 128 for interactive use.
-NGL = "0"  # GPU layers: 0 = CPU only
+# Both Metal OOM root causes fixed: sc_embT now falls back to CPU when GPU memory is tight,
+# and n_ubatch is correctly sized to canvas_length for the KV-cache path.
+NGL = "99"  # GPU layers: 99 = all layers on Metal
 
 app = FastAPI(title="DiffusionGemma OpenAI-compatible API")
 

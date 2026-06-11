@@ -1,0 +1,69 @@
+diff --git a/examples/diffusion/diffusion-cli.cpp b/examples/diffusion/diffusion-cli.cpp
+index ea78785ab..387a8894e 100644
+--- a/examples/diffusion/diffusion-cli.cpp
++++ b/examples/diffusion/diffusion-cli.cpp
+@@ -199,17 +199,32 @@ int main(int argc, char ** argv) {
+     }
+ 
+     // -n/--n-predict drives length for canvas models: derive the block count from the target token budget
+-    // and grow ubatch/batch/ctx to hold the final block's whole [prompt | canvas] in one pass, so
++    // and size ctx/ubatch/batch so generation works without manual tuning.
+     // --diffusion-blocks / -ub / -b / -c need not be set by hand. Larger explicit values are kept, and the
+     // denoise still stops early on an end token.
+     if (canvas_length > 0 && params.n_predict > 0) {
+         const int32_t cl     = (int32_t) canvas_length;
+         const int32_t blocks = (params.n_predict + cl - 1) / cl;
+-        const int32_t needed = blocks * cl + 2048;  // + headroom for the prompt / chat history
++        const int32_t needed = blocks * cl + 2048;  // ctx needs all blocks + prompt headroom
+         params.diffusion.blocks = blocks;
+-        params.n_ubatch = std::max(params.n_ubatch, needed);
++        params.n_ctx    = std::max(params.n_ctx, needed);
++
++        // For the KV-cache path (entropy-bound, single GPU/CPU) each step decodes only the canvas;
++        // the prefix is processed by a separate PREFILL pass that must also fit in one ubatch.
++        // n_ubatch only needs to cover max(n_input, canvas_length), so leave it at the user/default
++        // value unless it is too small for canvas_length. For the non-KV unified path, the whole
++        // [prompt|canvas] must fit in one ubatch, so keep the larger needed value.
++        int gpu_devs = 0;
++        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
++            const auto dt = ggml_backend_dev_type(ggml_backend_dev_get(i));
++            if (dt == GGML_BACKEND_DEVICE_TYPE_GPU || dt == GGML_BACKEND_DEVICE_TYPE_IGPU) { gpu_devs++; }
++        }
++        const bool will_use_kv = (params.diffusion.eb_mode != 2) &&
++                                  ((params.diffusion.eb_kv_cache == 1) ||
++                                   (params.diffusion.eb_kv_cache == 0 && gpu_devs <= 1));
++        const int32_t ubatch_floor = will_use_kv ? cl : needed;
++        params.n_ubatch = std::max(params.n_ubatch, ubatch_floor);
+         params.n_batch  = std::max(params.n_batch,  params.n_ubatch);
+-        params.n_ctx    = std::max(params.n_ctx,    needed);
+         LOG_INF("diffusion: -n %d -> %d blocks, n_ubatch=%d n_batch=%d n_ctx=%d (canvas_length=%d)\n",
+                 params.n_predict, blocks, params.n_ubatch, params.n_batch, params.n_ctx, cl);
+     }
+@@ -420,11 +435,23 @@ int main(int argc, char ** argv) {
+         for (int b = 0; b < n_blocks; b++) {
+             const int32_t prefix_len = (int32_t) prefix.size();
+             const int32_t max_length = prefix_len + (int32_t) canvas_length;
+-            if (max_length > max_ub) {
++            // KV-cache path: PREFILL and canvas decode are separate passes, each fitting in max_ub
++            // independently; only max(prefix, canvas) must be <= max_ub, not their sum.
++            const bool kv_path = use_eb && eb_params.kv_cache;
++            const int32_t ubatch_check = kv_path
++                ? std::max(prefix_len, (int32_t) canvas_length)
++                : max_length;
++            if (ubatch_check > max_ub) {
+                 if (b == 0) {
+-                    LOG_ERR("error: this diffusion model needs the whole [prompt | canvas] in one ubatch; "
+-                            "set -ub and -c >= n_input + canvas_length = %d + %d = %d\n",
+-                            prefix_len, (int) canvas_length, max_length);
++                    if (kv_path) {
++                        LOG_ERR("error: prefix or canvas too long for one ubatch; "
++                                "set -ub >= max(n_input, canvas_length) = max(%d, %d) = %d\n",
++                                prefix_len, (int) canvas_length, ubatch_check);
++                    } else {
++                        LOG_ERR("error: this diffusion model needs the whole [prompt | canvas] in one ubatch; "
++                                "set -ub and -c >= n_input + canvas_length = %d + %d = %d\n",
++                                prefix_len, (int) canvas_length, max_length);
++                    }
+                     return "";
+                 }
+                 break;  // out of ubatch room: stop and keep what we have
