@@ -29,8 +29,8 @@ from pydantic import BaseModel
 MODEL_PATH   = "/Users/waynetechlab/AI/models/diffusiongemma/diffusiongemma-26B-A4B-it-Q4_K_M.gguf"
 BINARY       = "/Users/waynetechlab/AI/llama.cpp-diffusiongemma/build/bin/llama-diffusion-cli"
 NGL          = "99"          # Metal GPU layers
-OLLAMA_UPSTREAM = "http://localhost:11434"
-PORT         = 11435
+OLLAMA_UPSTREAM = "http://localhost:11450"
+PORT         = 11434
 
 # Model name aliases that this server handles (everything else proxies upstream)
 DIFFUSION_NAMES = {
@@ -125,14 +125,16 @@ async def proxy_to_ollama(request: Request) -> JSONResponse:
 async def ollama_tags(request: Request):
     """Merge our model into the upstream Ollama tag list."""
     our_model = {
-        "name":        "diffusion-gemma",
-        "model":       "diffusion-gemma",
-        "modified_at": "2026-06-11T00:00:00Z",
+        "name":        "diffusion-gemma:latest",
+        "model":       "diffusion-gemma:latest",
+        "modified_at": "2026-06-11T00:00:00.000000000-07:00",
         "size":        16806811129,
-        "digest":      "local",
+        "digest":      "0ce1d29bcc425f42f97490390eaa4b2ced90bbd6c943b76544a6a6804db681ec",
         "details": {
+            "parent_model":       "",
             "format":             "gguf",
             "family":             "diffusion-gemma",
+            "families":           ["diffusion-gemma"],
             "parameter_size":     "26B",
             "quantization_level": "Q4_K_M",
         },
@@ -252,6 +254,12 @@ async def ollama_show(request: Request):
 @app.api_route("/api/{path:path}", methods=["GET", "POST", "DELETE", "HEAD"])
 async def proxy_other_ollama(request: Request, path: str):
     return await proxy_to_ollama(request)
+
+
+# Ollama CLI does HEAD / before any other request as a liveness check
+@app.api_route("/", methods=["GET", "HEAD"])
+async def root():
+    return JSONResponse({"status": "ok"})
 
 
 # ── OpenAI-compatible API ──────────────────────────────────────────────────────
